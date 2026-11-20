@@ -1,8 +1,8 @@
 {
   "manifestVersion": 2,
-  "id": "orca-pinboard",
+  "id": "claude-pinboard",
   "name": "Pinboard",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "The Claude pinboard pane for Orca: the focused workspace's latest Claude session as cards (branch, background tasks, intent tree, PRs and links, docs, prompt history) and a memo per workspace.",
   "author": { "name": "namnameeroo", "url": "https://github.com/namnameeroo" },
   "repository": "https://github.com/namnameeroo/orca-pinboard",
@@ -16,7 +16,7 @@
   "contributes": {
     "panels": [
       {
-        "id": "orca-pinboard",
+        "id": "pinboard",
         "title": "Pinboard",
         "icon": "layers",
         "entry": "src/panel.tsx",

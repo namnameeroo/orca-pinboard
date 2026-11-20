@@ -14,7 +14,8 @@ orca plugin install namnameeroo/orca-pinboard
 Orca lists what it asks for and waits for your approval: a Node worker that reads your
 `~/.claude` transcripts and intent files and runs `gh`, `pbcopy` and `open`; your workspaces and
 agent status; its own storage and settings. Then open **Pinboard** in the right sidebar.
-Update with `orca plugin update namnameeroo.orca-pinboard`.
+Update with `orca plugin update namnameeroo.claude-pinboard` (the plugin's id is
+`claude-pinboard`: Orca keeps ids starting `orca-` for its official plugins).
 
 Needs macOS, Orca 1.4.247 or newer, and the `gh` CLI signed in for PR states.
 
@@ -59,7 +60,7 @@ orca plugin dev load . --json        # asks for approval once: Node worker + wor
 orca plugin dev request . snap.get   # what the worker answers for the focused workspace
 orca plugin test .                   # src/*.test.ts(x)
 npx -p typescript@5.6.3 tsc -p .     # Node APIs the worker uses are typed in src/node.d.ts
-orca plugin shot local.orca-pinboard --panel orca-pinboard
+orca plugin shot local.claude-pinboard --panel pinboard
 ```
 
 `src/scan.ts` ports `scan`, `rollup` and `jiraMatcher` from pinboard's
