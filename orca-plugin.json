@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "claude-pinboard",
   "name": "Pinboard",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "The Claude pinboard pane for Orca: the focused workspace's latest Claude session as cards (branch, background tasks, intent tree, PRs and links, docs, prompt history) and a memo per workspace.",
   "author": { "name": "namnameeroo", "url": "https://github.com/namnameeroo" },
   "repository": "https://github.com/namnameeroo/orca-pinboard",
@@ -35,7 +35,7 @@
       {
         "key": "jiraProjects",
         "title": "Jira project keys",
-        "description": "Comma-separated project keys to pick up, e.g. WEB,APP. Any other KEY-123 (GPT-4, CVE-2024) is ignored.",
+        "description": "Comma-separated project keys to pick up, e.g. WEB,APP. Any other KEY-123 (GPT-4, CVE-2024) is ignored. Needs the Jira site too.",
         "type": "string",
         "default": "",
         "placeholder": "WEB,APP"
@@ -45,7 +45,6 @@
   "capabilities": [
     { "kind": "workspace:read" },
     { "kind": "agent:read" },
-    { "kind": "storage:own" },
     { "kind": "settings:own" }
   ]
 }

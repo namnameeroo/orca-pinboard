@@ -1,7 +1,9 @@
 // Pure: a Claude Code transcript (JSONL) as what the pinboard panel shows.
 // No Node or Orca imports, so the worker, the panel and the tests all load it.
-// scan / rollup / jiraMatcher are ported from ../pinboard/hooks/register.tsx;
-// keep the two in step when one changes.
+// scan, rollup, jiraMatcher, list, bgFromLog (from collect) and intentTree (from
+// layoutTree) are ported from pinboard's hooks/register.tsx in
+// github.com/namnameeroo/claude-mods; keep them in step. They differ on purpose:
+// rollup answers '' and plain marks, intentTree answers Tree items, list keeps a leading /.
 
 export type ToolUse = {
   tool: string
@@ -19,18 +21,21 @@ export type Msg = {
 export type Pr = {
   number: number
   title: string
-  state: 'OPEN' | 'DRAFT' | 'MERGED' | 'CLOSED'
+  state: 'OPEN' | 'DRAFT' | 'MERGED' | 'CLOSED' | 'UNKNOWN'
   review: string
   checks: string // CI rollup: ◐ running, ● pass, ✗ fail, '' none
   comments: number
   url: string
+  error?: string // gh could not answer: the row is its last answer, or only the link
 }
 export type Doc = { path: string; kind: 'new' | 'ref'; tag: 'tmp' | 'repo' | 'out' }
 export type Bg = {
   id: string
   label: string
   command: string
-  status: string // running | completed | failed | killed
+  // running, or the notification's word (completed, failed, killed, stopped, …),
+  // or lost: its output file is gone (a reboot, /tmp cleaned) and the task with it
+  status: string
   out: string
   port?: number
 }
@@ -39,6 +44,7 @@ export type TreeNode = { key: string; label: string; icon?: 'next'; children?: T
 
 export type Snap = {
   workspace: string
+  workspaceId: string // workspace.list's id: what agent events name as workspaceListId
   cwd: string
   home: string
   sid: string
@@ -52,6 +58,7 @@ export type Snap = {
   prompts: string[]
   docs: Doc[]
   bg: Bg[]
+  writtenAt: number // when the transcript was last written: an old session shows as old
   at: number
 }
 
@@ -102,7 +109,8 @@ export function toMessages(jsonl: string): Msg[] {
 }
 
 // Claude Code's folder for a cwd under ~/.claude/projects.
-// ponytail: no hashing of paths past 200 characters; add it if one comes up
+// ponytail: no hashing of paths past 200 characters, so such a workspace reads
+// "no Claude session"; add Claude Code's truncate + hash if one comes up
 export const slug = (path: string) => path.replace(/[^a-zA-Z0-9]/g, '-')
 
 export const list = (v: unknown) =>
@@ -126,8 +134,40 @@ export const rollup = (checks: unknown): string => {
   const st = checks.map((c: any) => c.conclusion ?? c.state ?? '')
   // GitHub's conclusions that are not a pass (SKIPPED and NEUTRAL pass)
   if (st.some((s) => /FAIL|ERROR|TIMED_OUT|CANCELLED|ACTION_REQUIRED/i.test(s))) return CI.fail
-  if (st.some((s) => /PENDING|IN_PROGRESS|QUEUED|^$/i.test(s))) return CI.run
+  // EXPECTED: a required status not reported yet; STALE: a run GitHub gave up on
+  if (st.some((s) => /PENDING|IN_PROGRESS|QUEUED|EXPECTED|WAITING|REQUESTED|STALE|^$/i.test(s))) return CI.run
   return CI.ok
+}
+
+const PR_STATES = ['OPEN', 'MERGED', 'CLOSED']
+
+// gh pr view's JSON (comments counted by its --jq) as a PR row
+export const toPr = (j: any): Pr => ({
+  number: j.number,
+  title: j.title,
+  // GitHub keeps isDraft on a draft it closed: only an open draft is a draft
+  state: j.state === 'OPEN' && j.isDraft ? 'DRAFT' : PR_STATES.includes(j.state) ? j.state : 'UNKNOWN',
+  review: j.reviewDecision ?? '',
+  checks: rollup(j.statusCheckRollup),
+  comments: typeof j.comments === 'number' ? j.comments : 0,
+  url: j.url
+})
+
+// how `open` treats a doc's real path: its app for markdown, Finder for anything else
+export const openPlan = (real: string) =>
+  /\.(md|markdown)$/i.test(real)
+    ? { args: [real], how: 'opened' as const }
+    : { args: ['-R', real], how: 'revealed' as const }
+
+// a link worth pinning, judged by its host (read by hand: not every runtime this
+// file runs in has URL): an Atlassian, Figma or Notion page, or a Claude artifact
+const pinnable = (u: string) => {
+  const m = /^https?:\/\/(?:[^/?#@]*@)?([^/?#:]+)(?::\d+)?(\/[^?#]*)?/i.exec(u)
+  const host = (m?.[1] ?? '').toLowerCase()
+  const path = m?.[2] ?? ''
+  return host === 'claude.ai'
+    ? /^\/(code\/)?artifact\//.test(path)
+    : /(^|\.)(atlassian\.net|figma\.com|notion\.so)$/.test(host) && path.length > 1 // a bare domain is not a page
 }
 
 const uniq = <T>(xs: T[]) => [...new Set(xs)]
@@ -139,21 +179,19 @@ export function scan(msgs: readonly Msg[], root: string, branch: string, jiraKey
   // message text only: tool output (a grep over fixtures) would crowd it out
   const said = msgs.map((m) => m.text).join('\n')
 
+  // GitHub names are case-insensitive: Acme/Web#1 and acme/web#1 are one PR
   const prRefs = recent(
-    [...said.matchAll(/github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)/g)].map((m) => `${m[1]}#${m[2]}`),
+    [...said.matchAll(/github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)/g)].map((m) => `${m[1]!.toLowerCase()}#${m[2]}`),
     5
   )
   // the branch last: the latest mention, so its key always stays
   const jira = jiraKey ? recent(`${said} ${branch}`.match(jiraKey) ?? [], 3) : []
+  // URL characters only (ASCII: a Korean particle right after one is not part of it),
+  // less the punctuation that ends a sentence
   const links = recent(
-    [...said.matchAll(/https?:\/\/[^\s)<>\]"'`]+/g)]
-      .map((m) => m[0])
-      .filter(
-        (u) =>
-          /claude\.ai\/(code\/)?artifact|atlassian\.net|figma\.com|notion\.so/.test(u) &&
-          /^https?:\/\/[^/]+\/[^/]/.test(u) && // a bare domain is not a link worth pinning
-          !/[<>{}]/.test(u)
-      ),
+    [...said.matchAll(/https?:\/\/[\w\-.~:/?#@!$&*+,;=%]+/g)]
+      .map((m) => m[0].replace(/[.,;:!?]+$/, ''))
+      .filter(pinnable),
     5
   )
 
@@ -168,20 +206,24 @@ export function scan(msgs: readonly Msg[], root: string, branch: string, jiraKey
     .map((m) => m.text.split('\n')[0] ?? '')
     .slice(-20)
 
+  // under the root, not beside it: /repo-feat is not /repo
   const tag = (p: string): Doc['tag'] =>
-    /scratchpad|^\/(private\/)?tmp\//.test(p) ? 'tmp' : p.startsWith(root) ? 'repo' : 'out'
+    /scratchpad|^\/(private\/)?tmp\//.test(p) ? 'tmp' : p.startsWith(root.replace(/\/$/, '') + '/') ? 'repo' : 'out'
   const docMap = new Map<string, Doc>()
   for (const m of msgs)
     for (const t of m.toolUses) {
       const p = String(t.input.file_path ?? '')
       if (!p.endsWith('.md')) continue
-      if (t.tool === 'Write') docMap.set(p, { path: p, kind: 'new', tag: tag(p) })
-      else if (t.tool === 'Read' && !docMap.has(p)) docMap.set(p, { path: p, kind: 'ref', tag: tag(p) })
+      if (t.tool === 'Write') {
+        docMap.delete(p) // a Map keeps a key where it was first set: written now, it moves last
+        docMap.set(p, { path: p, kind: 'new', tag: tag(p) })
+      } else if (t.tool === 'Read' && !docMap.has(p)) docMap.set(p, { path: p, kind: 'ref', tag: tag(p) })
     }
   const docs = [...docMap.values()].slice(-6)
 
   // background Bash: its result names the task and output file; a later
-  // <task-notification> carrying its tool-use-id says how it ended
+  // <task-notification> carrying its tool-use-id says how it ended. The notice can
+  // arrive inside a tool result, so this reads tool output too.
   const corpus = msgs
     .flatMap((m) => [m.text, ...m.toolUses.map((t) => t.text ?? ''), ...m.toolResults.map((r) => r.text)])
     .join('\n')
@@ -211,7 +253,9 @@ export function scan(msgs: readonly Msg[], root: string, branch: string, jiraKey
   return { prRefs, jira, links, prompts, docs, bg }
 }
 
-// a running task's log: its exit if it ended, else the port it serves
+// a running task's log: its exit if it ended, else the port it serves.
+// ponytail: no notification and no exit line = running, so a task whose shell died
+// with Claude Code reads running while its log file stays (a missing one reads lost)
 export function bgFromLog(b: Bg, log: string): Bg {
   if (b.status !== 'running') return b
   const exit = /\[exited with code (\d+)\]\s*$/.exec(log)

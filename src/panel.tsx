@@ -1,6 +1,7 @@
-// The pinboard pane of ../pinboard as an Orca sidebar panel: read-only cards over
-// the focused workspace's newest Claude session, plus a memo kept per workspace.
-// Orca draws it in its own UI font: Orca icons, not Nerd glyphs.
+// The pinboard pane (pinboard in github.com/namnameeroo/claude-mods) as an Orca sidebar
+// panel: read-only cards over the focused workspace's newest Claude session, plus a memo
+// kept per workspace. Orca draws it in its own UI font, which has no Nerd Font glyphs:
+// Orca's icons and plain Unicode marks.
 import {
   atom,
   Card,
@@ -13,6 +14,7 @@ import {
   on,
   plugin,
   read,
+  RelativeTime,
   Row,
   set,
   Spinner,
@@ -21,20 +23,27 @@ import {
   Textarea,
   Tree,
   type OrcaNode,
-  type PanelContext
+  type PanelContext,
+  type PluginRequestOutput,
+  type Tone
 } from 'orca'
 import './protocol'
-import { CI, tilde, type Bg, type Pr, type Snap, type TreeNode } from './scan'
+import { CI, tilde, type Bg, type Pr, type TreeNode } from './scan'
 
-type Answer = { snap: Snap | null; note?: string }
+type Answer = PluginRequestOutput<'snap.get'>
 
+// the last answer that read the workspace (a session or a note why there is none)
 const answer = atom<Answer | null>(null)
+// why the last refresh failed; the answer before it stays shown
+const failure = atom<string | null>(null)
 const memo = atom('memo', '', { persist: 'workspace' })
 // what the last copy or open came to, shown in its card until the next refresh
 const flash = atom<{ at: 'sid' | 'doc'; text: string; isError: boolean } | null>(null)
 
-// Events come in bursts (an agent goes working → waiting → done): one request at
-// a time, and one more after it if anything asked meanwhile.
+const why = (e: { code?: string; message?: string }) => e.message || e.code || String(e)
+
+// Events come in bursts (an agent goes working → waiting → done): one request at a time,
+// and one more after it if anything asked meanwhile. Exported for the tests.
 let running = false
 let again = false
 export async function refresh(): Promise<void> {
@@ -46,15 +55,15 @@ export async function refresh(): Promise<void> {
   try {
     do {
       again = false
-      set(
-        answer,
-        await plugin
-          .request('snap.get', undefined, { timeoutMs: 60_000 })
-          .catch((e: { code?: string; message?: string }) => ({
-            snap: null,
-            note: `불러오지 못했습니다: ${e.code ?? e.message}`
-          }))
-      )
+      const r: Answer = await plugin
+        .request('snap.get', undefined, { timeoutMs: 60_000 })
+        .catch((e: { code?: string; message?: string }) => ({ snap: null, error: why(e) }))
+      // a failed refresh says why and keeps what was shown, rather than emptying the pane
+      if (r.error) set(failure, r.error)
+      else {
+        set(answer, r)
+        set(failure, null)
+      }
       set(flash, null)
     } while (again)
   } finally {
@@ -62,7 +71,24 @@ export async function refresh(): Promise<void> {
   }
 }
 
-const refused = (e: { code?: string; message?: string }) => ({ ok: false, error: e.code ?? e.message })
+// workspace.changed fires once as the panel subscribes (the first load), then on each
+// switch and terminal change. Agent events in other workspaces are passed over.
+// ponytail: no timer, so CI turning green while every agent idles shows on the next event
+// or the refresh button (upgrade: a worker interval posting to the panel; a worker stays
+// up only with a status bar item), and the focused workspace's agents refresh it even
+// while the panel is hidden
+export function setup(ctx: PanelContext): void {
+  ctx.subscriptions.push(
+    on('workspace.changed', () => void refresh()),
+    on('agent.status.changed', (e) => {
+      const shown = read(answer)?.snap?.workspaceId
+      if (e.workspaceListId && shown && e.workspaceListId !== shown) return
+      void refresh()
+    })
+  )
+}
+
+const refused = (e: { code?: string; message?: string }) => ({ ok: false, error: why(e) })
 
 // the worker does both: a panel has no clipboard and cannot start an app
 async function copySid(sid: string): Promise<void> {
@@ -92,36 +118,31 @@ function Flash({ at }: { at: 'sid' | 'doc' }) {
   ) : null
 }
 
-// ponytail: no timer (panels have none); CI turning green while every agent
-// idles shows on the next event or the refresh button
-export function setup(ctx: PanelContext): void {
-  ctx.subscriptions.push(
-    on('workspace.changed', () => void refresh()),
-    on('agent.status.changed', () => void refresh())
-  )
-  void refresh()
-}
-
-const STATE: Record<Pr['state'], [string, 'success' | 'accent' | 'danger' | 'neutral']> = {
+// a state Orca does not name (gh added one) reads as itself
+const STATE: Partial<Record<string, [string, Tone]>> = {
   OPEN: ['[open]', 'success'],
   DRAFT: ['[draft]', 'neutral'],
   MERGED: ['[merged]', 'accent'],
-  CLOSED: ['[closed]', 'danger']
+  CLOSED: ['[closed]', 'danger'],
+  UNKNOWN: ['[?]', 'neutral']
 }
-const REVIEW: Record<string, [string, 'success' | 'danger' | 'neutral']> = {
+const REVIEW: Partial<Record<string, [string, Tone]>> = {
   APPROVED: ['승인', 'success'],
   CHANGES_REQUESTED: ['변경 요청', 'danger'],
   REVIEW_REQUIRED: ['리뷰 대기', 'neutral']
 }
-const CI_TONE: Record<string, 'success' | 'warning' | 'danger'> = {
+const CI_TONE: Partial<Record<string, Tone>> = {
   [CI.ok]: 'success',
   [CI.run]: 'warning',
   [CI.fail]: 'danger'
 }
-const BG: Record<string, [string, 'warning' | 'danger' | 'neutral']> = {
+// a background task's mark, as pinboard draws it: running ◐, done ● dim, failed ✗ red,
+// stopped or killed ✗ dim; lost ? dim: its output file is gone
+const BG: Partial<Record<string, [string, Tone?]>> = {
   running: [CI.run, 'warning'],
-  completed: [CI.ok, 'neutral'],
-  failed: [CI.fail, 'danger']
+  completed: [CI.ok],
+  failed: [CI.fail, 'danger'],
+  lost: ['?']
 }
 
 const keys = (ns: readonly TreeNode[]): string[] => ns.flatMap((n) => [n.key, ...keys(n.children ?? [])])
@@ -149,18 +170,18 @@ function Section({ title, meta, extra, children }: { title: string; meta?: strin
   )
 }
 
-// two lines: #number (the link) and the title, then the cells that say something
-// (CI and review only while open). Text cells, not Badges: a toned Badge adds a dot.
+// line 1: #number (the link) and the title; line 2: the cells that say something (CI and
+// review only while open, and why gh failed). Text cells, not Badges: a toned Badge adds a dot.
 function PrRow({ p }: { p: Pr }) {
   const isOpen = p.state === 'OPEN' || p.state === 'DRAFT'
-  const [state, tone] = STATE[p.state]
+  const [state, tone] = STATE[p.state] ?? [`[${p.state.toLowerCase()}]`, 'neutral']
   const review = isOpen ? REVIEW[p.review] : undefined
   return (
     <Stack gap="xs">
       <Text truncate>
         <Link href={p.url}>{`#${p.number}`}</Link> {p.title}
       </Text>
-      <Row gap="sm">
+      <Row gap="sm" wrap>
         <Text tone={tone} size="xs">
           {state}
         </Text>
@@ -179,16 +200,23 @@ function PrRow({ p }: { p: Pr }) {
             {`코멘트 ${p.comments}`}
           </Text>
         ) : null}
+        {p.error ? (
+          <Text tone="warning" size="xs" truncate>
+            {`gh 실패: ${p.error}`}
+          </Text>
+        ) : null}
       </Row>
     </Stack>
   )
 }
 
 function BgRow({ b }: { b: Bg }) {
-  const [mark, tone] = BG[b.status] ?? [CI.fail, 'neutral'] // killed
+  const [mark, tone] = BG[b.status] ?? [CI.fail] // stopped, killed, or a word not known: a dim ✗
   return (
     <Row gap="sm">
-      <Text tone={tone}>{mark}</Text>
+      <Text tone={tone} muted={!tone}>
+        {mark}
+      </Text>
       {b.port ? <Link href={`http://localhost:${b.port}`}>{`localhost:${b.port}`}</Link> : null}
       <Text truncate muted={b.status !== 'running'}>
         {b.label}
@@ -199,21 +227,33 @@ function BgRow({ b }: { b: Bg }) {
 
 export default function Panel() {
   const a = read(answer)
-  if (!a) return <Spinner label="불러오는 중" />
+  const failed = read(failure)
+  const retry = <IconButton icon="refresh" label="새로고침" onPress={refresh} />
+  if (!a)
+    return failed ? (
+      <Stack gap="md">
+        <EmptyState title="불러오지 못했습니다" description={failed} icon="warning" />
+        {retry}
+      </Stack>
+    ) : (
+      <Spinner label="불러오는 중" />
+    )
   if (!a.snap)
     return (
       <Stack gap="md">
         <EmptyState title="표시할 세션이 없습니다" description={a.note} icon="agent" />
-        <IconButton icon="refresh" label="새로고침" onPress={refresh} />
+        {failed ? <Text tone="danger" size="xs">{`새로고침 실패: ${failed}`}</Text> : null}
+        {retry}
       </Stack>
     )
   const s = a.snap
-  const running = s.bg.filter((b) => b.status === 'running').length
+  const live = s.bg.filter((b) => b.status === 'running').length
   const nLinks = s.prs.length + s.jira.length + s.links.length
   const path = (p: string) => tilde(p, s.home)
 
   return (
     <Stack gap="md">
+      {failed ? <Text tone="danger" size="xs">{`새로고침 실패: ${failed}`}</Text> : null}
       <Section
         title="세션"
         meta={`⟳ ${new Date(s.at).toTimeString().slice(0, 5)}`}
@@ -227,12 +267,15 @@ export default function Panel() {
             <Text muted size="xs">{`sid ${s.sid}`}</Text>
             <IconButton icon="copy" label="세션 id 복사" size="xs" variant="ghost" onPress={() => copySid(s.sid)} />
           </Row>
+          <Text muted size="xs">
+            마지막 기록 <RelativeTime at={s.writtenAt} />
+          </Text>
           <Flash at="sid" />
         </Stack>
       </Section>
 
       {s.bg.length > 0 ? (
-        <Section title="백그라운드" meta={`실행 ${running}/${s.bg.length}`}>
+        <Section title="백그라운드" meta={`실행 ${live}/${s.bg.length}`}>
           <Stack gap="xs">
             {s.bg.map((b) => (
               <BgRow b={b} />
