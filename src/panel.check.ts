@@ -1,7 +1,7 @@
 // `orca plugin check` renders the panel once per scenario, each with the worker on a fresh
-// host. Orca fires workspace.changed once as the panel subscribes; each scenario stands in
-// for that event, which is what makes the panel ask. Both answer a note before the worker
-// reads any file.
+// host. Orca fires workspace.changed once as the panel subscribes; each scenario's events
+// entry stands in for it, which is what makes the panel ask (check's stand-in host is not
+// documented to do so itself). Both answer a note before the worker reads any file.
 import { defineCheck } from 'orca/testing'
 
 const WEB = { workspaceId: 'w1', branch: 'main', displayName: 'web', terminals: [] }

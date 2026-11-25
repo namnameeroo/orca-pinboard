@@ -36,13 +36,13 @@ const SNAP: Snap = {
 const CONTEXT = { workspaceId: 'ctx-1', branch: 'feat/WEB-9', displayName: 'toys', terminals: [] }
 const AGENT = { workspaceId: 'ctx-1', paneKey: 'p', state: 'done' as const, receivedAt: 1 }
 
-async function open(requests: NonNullable<Parameters<typeof mockHost>[0]>['requests']) {
+type Requests = NonNullable<Parameters<typeof mockHost>[0]>['requests']
+async function open(requests: Requests, emit = true) {
   const host = mockHost({ requests })
   const view = await mount(panel, { host })
-  await view.emit('workspace.changed', { context: CONTEXT })
+  if (emit) await view.emit('workspace.changed', { context: CONTEXT })
   return { host, view }
 }
-const drawn = (view: { tree(): unknown }) => JSON.stringify(view.tree())
 
 test('draws the session as cards', async () => {
   const { view } = await open({ 'snap.get': () => ({ snap: SNAP }) })
@@ -53,7 +53,8 @@ test('draws the session as cards', async () => {
   assert.ok(view.find({ text: 'localhost:5180' }))
   assert.ok(view.find({ text: 'WEB-9' }))
   assert.ok(view.find({ text: 'acme.atlassian.net/wiki/x' })) // a link, its scheme left off
-  assert.match(drawn(view), /마지막 기록/) // when the transcript was written: an old session reads old
+  // when the transcript was written: an old session reads old, not "now"
+  assert.equal(view.find({ type: 'RelativeTime' })?.props.at, SNAP.writtenAt)
   assert.deepEqual(view.expandedOf({ label: '작업 트리' }), ['i0', 'i1'])
   assert.deepEqual(view.errors, [])
   assert.deepEqual(view.warnings, [])
@@ -67,36 +68,52 @@ test('opening the panel asks the worker once', async () => {
   await view.unmount()
 })
 
+test('before any answer the spinner has a refresh button', async () => {
+  const { view } = await open({ 'snap.get': () => ({ snap: SNAP }) }, false) // no subscribe-time event
+  assert.ok(view.find({ type: 'Spinner' }))
+  await view.press({ label: '새로고침' })
+  assert.ok(view.find({ text: '⎇ feat/WEB-9' }))
+  await view.unmount()
+})
+
 test('says why when there is no session, and retries on the button', async () => {
   let snap: Snap | null = null
-  const { view } = await open({ 'snap.get': () => ({ snap, note: '포커스된 워크스페이스가 없습니다.' }) })
-  // the note is the EmptyState's description, a prop rather than a text node
-  assert.match(drawn(view), /포커스된 워크스페이스가 없습니다\./)
+  const { view } = await open({
+    'snap.get': () => (snap ? { snap } : { snap: null, note: '포커스된 워크스페이스가 없습니다.' })
+  })
+  assert.equal(view.find({ type: 'EmptyState' })?.props.description, '포커스된 워크스페이스가 없습니다.')
   snap = SNAP
   await view.press({ label: '새로고침' })
   assert.ok(view.find({ text: '⎇ feat/WEB-9' }))
   await view.unmount()
 })
 
-test('a failed refresh keeps the cards and says why', async () => {
-  let fail: 'throw' | 'answer' | null = null
+test('a failed refresh keeps the cards and says why, at the top and on the session card', async () => {
+  let fail: 'throw' | 'answer' | 'empty' | null = null
   const { view } = await open({
     'snap.get': () => {
       if (fail === 'throw') throw hostError('timeout', 'the worker took too long')
-      return fail === 'answer' ? { snap: null, error: 'EACCES: permission denied' } : { snap: SNAP }
+      if (fail === 'answer') return { snap: null, error: 'EACCES: permission denied' }
+      if (fail === 'empty') return { snap: null, error: '' }
+      return { snap: SNAP }
     }
   })
   fail = 'throw'
   await view.press({ label: '새로고침' })
   assert.ok(view.find({ text: '⎇ feat/WEB-9' })) // the last answer stays
-  assert.match(drawn(view), /새로고침 실패: the worker took too long/) // its message, not only its code
+  assert.ok(view.find({ text: '새로고침 실패: the worker took too long' })) // its message, not only its code
+  assert.ok(view.find({ text: /갱신 실패/ })) // beside the ⟳ time too: the cards are stale
   fail = 'answer'
   await view.press({ label: '새로고침' })
   assert.ok(view.find({ text: '⎇ feat/WEB-9' }))
-  assert.match(drawn(view), /새로고침 실패: EACCES: permission denied/)
+  assert.ok(view.find({ text: '새로고침 실패: EACCES: permission denied' }))
+  fail = 'empty' // an error with no words is still an error
+  await view.press({ label: '새로고침' })
+  assert.ok(view.find({ text: '⎇ feat/WEB-9' }))
+  assert.ok(view.find({ text: /새로고침 실패/ }))
   fail = null
   await view.press({ label: '새로고침' })
-  assert.ok(!/새로고침 실패/.test(drawn(view)))
+  assert.equal(view.find({ text: /새로고침 실패|갱신 실패/ }), null)
   await view.unmount()
 })
 
@@ -106,8 +123,51 @@ test('a first load that fails says why instead of spinning', async () => {
       throw Object.assign(new Error('boom'), { code: 'action_failed' })
     }
   })
-  assert.match(drawn(view), /불러오지 못했습니다/)
-  assert.match(drawn(view), /boom/)
+  const empty = view.find({ type: 'EmptyState' })
+  assert.equal(empty?.label, '불러오지 못했습니다')
+  assert.equal(empty?.props.description, 'boom')
+  await view.unmount()
+})
+
+test("a refresh that fails right after a workspace switch shows nothing of the old workspace's", async () => {
+  let calls = 0
+  let fail = false
+  const { view } = await open({
+    'snap.get': () => {
+      calls++
+      if (fail) throw hostError('unavailable', 'the worker is restarting')
+      return { snap: SNAP }
+    }
+  })
+  fail = true
+  await view.emit('workspace.changed', { context: { ...CONTEXT, workspaceId: 'ctx-2', displayName: 'web' } })
+  assert.equal(view.find({ text: '⎇ feat/WEB-9' }), null)
+  assert.equal(view.find({ label: '한줄메모' }), null) // no memo under the old workspace's name
+  assert.equal(view.find({ type: 'EmptyState' })?.label, '불러오지 못했습니다')
+  const before = calls
+  await view.emit('agent.status.changed', { ...AGENT, workspaceListId: 'w-web' }) // the focused one's agent
+  assert.equal(calls, before + 1)
+  await view.unmount()
+})
+
+test('an answer for the old workspace that lands after a switch is dropped', async () => {
+  let calls = 0
+  const { view } = await open({
+    'snap.get': () => {
+      calls++
+      if (calls === 2) {
+        // the focus moves while this request for the old workspace runs
+        panel.onWorkspaceChanged({ workspaceId: 'ctx-3' })
+        return { snap: SNAP }
+      }
+      if (calls === 3) throw hostError('unavailable', 'the worker is restarting')
+      return { snap: SNAP }
+    }
+  })
+  await view.press({ label: '새로고침' })
+  await view.settled()
+  assert.equal(calls, 3)
+  assert.equal(view.find({ text: '⎇ feat/WEB-9' }), null) // not the old workspace's cards
   await view.unmount()
 })
 
@@ -156,7 +216,7 @@ test('the memo persists per workspace', async () => {
 })
 
 test('a PR gh could not read says so; a task that ended or vanished draws dim', async () => {
-  const { port: _, ...quiet } = SNAP.bg[0]! // no port key: undefined is not JSON, the answer would be refused
+  const { port: _, ...quiet } = SNAP.bg[0]! // no port key: undefined is no JSON value
   const { view } = await open({
     'snap.get': () => ({
       snap: {
@@ -172,12 +232,20 @@ test('a PR gh could not read says so; a task that ended or vanished draws dim', 
   })
   assert.ok(view.find({ text: '[?]' }))
   assert.ok(view.find({ text: 'gh 실패: gh auth login' }))
-  const tree = drawn(view)
-  assert.match(tree, /"muted":true\},"children":\["✗"\]/) // killed: a dim ✗, not a failure
-  assert.match(tree, /"muted":true\},"children":\["\?"\]/) // lost
-  assert.match(tree, /"tone":"danger"[^}]*\},"children":\["✗"\]/) // failed: a red ✗
-  assert.ok(!view.find({ text: 'localhost:5180' }))
+  const marks = (t: string) => view.findAll({ type: 'Text', text: t }).map((e) => [e.props.tone, e.props.muted])
+  assert.deepEqual(marks('✗'), [
+    [undefined, true], // killed: a dim ✗, not a failure
+    ['danger', false] // failed: a red ✗
+  ])
+  assert.deepEqual(marks('?'), [[undefined, true]]) // lost
+  assert.equal(view.find({ text: 'localhost:5180' }), null)
   assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('an intent file that could not be read is said on the work card', async () => {
+  const { view } = await open({ 'snap.get': () => ({ snap: { ...SNAP, tree: [], current: '', intentError: 'Unexpected token' } }) })
+  assert.ok(view.find({ text: '읽지 못함' }))
   await view.unmount()
 })
 
@@ -191,10 +259,10 @@ test('copies the session id and opens a doc through the worker', async () => {
   })
   await view.press({ label: '세션 id 복사' })
   assert.ok(view.find({ text: '세션 id 복사됨' }))
-  await view.press({ type: 'ListItem' }) // the one doc; a ListItem's title is a prop, not a text node
+  await view.press({ label: 'docs/plan.md' }) // a ListItem's title is its label
   assert.ok(view.find({ text: '열림: docs/plan.md' }))
   how = 'revealed'
-  await view.press({ type: 'ListItem' })
+  await view.press({ label: 'docs/plan.md' })
   assert.ok(view.find({ text: 'Finder에서 표시: docs/plan.md' }))
   assert.deepEqual(asked.slice(0, 2), [
     ['copy', { text: SNAP.sid }], // the whole id, never cut
@@ -204,15 +272,17 @@ test('copies the session id and opens a doc through the worker', async () => {
   await view.unmount()
 })
 
-test('a copy or an open that fails says why', async () => {
+test('a copy or an open that fails says why, its message first', async () => {
   const { view } = await open({
     'snap.get': () => ({ snap: SNAP }),
-    'clip.copy': () => ({ ok: false, error: 'no pbcopy' }),
+    'clip.copy': () => {
+      throw hostError('timeout', 'the worker took too long')
+    },
     'doc.open': () => ({ ok: false, error: '파일이 없습니다' })
   })
   await view.press({ label: '세션 id 복사' })
-  assert.ok(view.find({ text: '복사 실패: no pbcopy' }))
-  await view.press({ type: 'ListItem' })
+  assert.ok(view.find({ text: '복사 실패: the worker took too long' }))
+  await view.press({ label: 'docs/plan.md' })
   assert.ok(view.find({ text: '열기 실패: 파일이 없습니다 (docs/plan.md)' }))
   await view.unmount()
 })

@@ -28,13 +28,14 @@ import {
   type Tone
 } from 'orca'
 import './protocol'
-import { CI, tilde, type Bg, type Pr, type TreeNode } from './scan'
+import { CI, LOST, tilde, type Bg, type Pr, type TreeNode } from './scan'
 
 type Answer = PluginRequestOutput<'snap.get'>
+type Shown = Exclude<Answer, { error: string }>
 
-// the last answer that read the workspace (a session or a note why there is none)
-const answer = atom<Answer | null>(null)
-// why the last refresh failed; the answer before it stays shown
+// the last answer that read the focused workspace (a session, or a note why there is none)
+const answer = atom<Shown | null>(null)
+// why the last refresh failed; the answer before it stays shown (it is the same workspace's)
 const failure = atom<string | null>(null)
 const memo = atom('memo', '', { persist: 'workspace' })
 // what the last copy or open came to, shown in its card until the next refresh
@@ -46,6 +47,11 @@ const why = (e: { code?: string; message?: string }) => e.message || e.code || S
 // and one more after it if anything asked meanwhile. Exported for the tests.
 let running = false
 let again = false
+// the focused workspace (readContext's id) and a count of its changes: an answer asked for
+// before the focus moved is the old workspace's, and is dropped
+let focused: string | null | undefined
+let focusGen = 0
+
 export async function refresh(): Promise<void> {
   if (running) {
     again = true
@@ -55,12 +61,17 @@ export async function refresh(): Promise<void> {
   try {
     do {
       again = false
-      const r: Answer = await plugin
-        .request('snap.get', undefined, { timeoutMs: 60_000 })
+      const gen = focusGen
+      const r: Answer = await Promise.resolve()
+        .then(() => plugin.request('snap.get', undefined, { timeoutMs: 60_000 }))
         .catch((e: { code?: string; message?: string }) => ({ snap: null, error: why(e) }))
-      // a failed refresh says why and keeps what was shown, rather than emptying the pane
-      if (r.error) set(failure, r.error)
-      else {
+      if (gen !== focusGen) continue // the focus moved while it ran: the switch asked again
+      if ('error' in r) {
+        // a failed refresh says why and keeps what was shown, rather than emptying the pane
+        const text = r.error || '이유를 알 수 없음'
+        console.warn(`pinboard: snap.get: ${text}`) // orca plugin logs shows a panel's warnings
+        set(failure, text)
+      } else {
         set(answer, r)
         set(failure, null)
       }
@@ -72,14 +83,29 @@ export async function refresh(): Promise<void> {
 }
 
 // workspace.changed fires once as the panel subscribes (the first load), then on each
-// switch and terminal change. Agent events in other workspaces are passed over.
+// switch and terminal change. A switch drops what was shown: it was another workspace's.
+export function onWorkspaceChanged(context: { workspaceId?: string } | null): void {
+  const id = context?.workspaceId ?? null
+  if (id !== focused) {
+    if (focused !== undefined) {
+      focusGen++
+      set(answer, null)
+      set(failure, null)
+    }
+    focused = id
+  }
+  void refresh()
+}
+
+// Agent events naming another workspace than the one shown are passed over; one with no
+// workspaceListId, or while no session is shown, still refreshes.
 // ponytail: no timer, so CI turning green while every agent idles shows on the next event
 // or the refresh button (upgrade: a worker interval posting to the panel; a worker stays
-// up only with a status bar item), and the focused workspace's agents refresh it even
-// while the panel is hidden
+// up only with a status bar item), and the shown workspace's agents refresh it even while
+// the panel is hidden (upgrade: skip while !read(ctx.visible), refresh once it shows)
 export function setup(ctx: PanelContext): void {
   ctx.subscriptions.push(
-    on('workspace.changed', () => void refresh()),
+    on('workspace.changed', (e) => onWorkspaceChanged(e.context)),
     on('agent.status.changed', (e) => {
       const shown = read(answer)?.snap?.workspaceId
       if (e.workspaceListId && shown && e.workspaceListId !== shown) return
@@ -88,7 +114,7 @@ export function setup(ctx: PanelContext): void {
   )
 }
 
-const refused = (e: { code?: string; message?: string }) => ({ ok: false, error: why(e) })
+const refused = (e: { code?: string; message?: string }) => ({ ok: false as const, error: why(e) })
 
 // the worker does both: a panel has no clipboard and cannot start an app
 async function copySid(sid: string): Promise<void> {
@@ -100,11 +126,7 @@ async function openDoc(path: string, label: string): Promise<void> {
   const r = await plugin.request('doc.open', { path }).catch(refused)
   set(flash, {
     at: 'doc',
-    text: !r.ok
-      ? `열기 실패: ${r.error} (${label})`
-      : 'how' in r && r.how === 'revealed'
-        ? `Finder에서 표시: ${label}`
-        : `열림: ${label}`,
+    text: !r.ok ? `열기 실패: ${r.error} (${label})` : r.how === 'revealed' ? `Finder에서 표시: ${label}` : `열림: ${label}`,
     isError: !r.ok
   })
 }
@@ -118,31 +140,33 @@ function Flash({ at }: { at: 'sid' | 'doc' }) {
   ) : null
 }
 
-// a state Orca does not name (gh added one) reads as itself
-const STATE: Partial<Record<string, [string, Tone]>> = {
+// every state a PR row can have: the compiler holds this table to Pr['state']
+const STATE: Record<Pr['state'], [string, Tone]> = {
   OPEN: ['[open]', 'success'],
   DRAFT: ['[draft]', 'neutral'],
   MERGED: ['[merged]', 'accent'],
   CLOSED: ['[closed]', 'danger'],
   UNKNOWN: ['[?]', 'neutral']
 }
+// open-ended keys (gh's review words, a notification's status): a lookup may miss
 const REVIEW: Partial<Record<string, [string, Tone]>> = {
   APPROVED: ['승인', 'success'],
   CHANGES_REQUESTED: ['변경 요청', 'danger'],
   REVIEW_REQUIRED: ['리뷰 대기', 'neutral']
 }
-const CI_TONE: Partial<Record<string, Tone>> = {
+const CI_TONE: Record<Exclude<Pr['checks'], ''>, Tone> = {
   [CI.ok]: 'success',
   [CI.run]: 'warning',
   [CI.fail]: 'danger'
 }
-// a background task's mark, as pinboard draws it: running ◐, done ● dim, failed ✗ red,
-// stopped or killed ✗ dim; lost ? dim: its output file is gone
+// a background task's mark in pinboard's colors (plain marks for its Nerd glyphs): running
+// ◐ warning, done ● dim, failed ✗ red, stopped/killed/unknown ✗ dim; lost ? dim
+// (orca-pinboard only: its output file is gone)
 const BG: Partial<Record<string, [string, Tone?]>> = {
   running: [CI.run, 'warning'],
   completed: [CI.ok],
   failed: [CI.fail, 'danger'],
-  lost: ['?']
+  [LOST]: ['?']
 }
 
 const keys = (ns: readonly TreeNode[]): string[] => ns.flatMap((n) => [n.key, ...keys(n.children ?? [])])
@@ -170,11 +194,11 @@ function Section({ title, meta, extra, children }: { title: string; meta?: strin
   )
 }
 
-// line 1: #number (the link) and the title; line 2: the cells that say something (CI and
-// review only while open, and why gh failed). Text cells, not Badges: a toned Badge adds a dot.
+// #number (the link) and the title, then the cells that say something, wrapping: CI and
+// review only while open, and why gh failed. Text cells, not Badges: a toned Badge adds a dot.
 function PrRow({ p }: { p: Pr }) {
   const isOpen = p.state === 'OPEN' || p.state === 'DRAFT'
-  const [state, tone] = STATE[p.state] ?? [`[${p.state.toLowerCase()}]`, 'neutral']
+  const [state, tone] = STATE[p.state]
   const review = isOpen ? REVIEW[p.review] : undefined
   return (
     <Stack gap="xs">
@@ -236,7 +260,10 @@ export default function Panel() {
         {retry}
       </Stack>
     ) : (
-      <Spinner label="불러오는 중" />
+      <Stack gap="md">
+        <Spinner label="불러오는 중" />
+        {retry}
+      </Stack>
     )
   if (!a.snap)
     return (
@@ -250,13 +277,14 @@ export default function Panel() {
   const live = s.bg.filter((b) => b.status === 'running').length
   const nLinks = s.prs.length + s.jira.length + s.links.length
   const path = (p: string) => tilde(p, s.home)
+  const time = `⟳ ${new Date(s.at).toTimeString().slice(0, 5)}`
 
   return (
     <Stack gap="md">
       {failed ? <Text tone="danger" size="xs">{`새로고침 실패: ${failed}`}</Text> : null}
       <Section
         title="세션"
-        meta={`⟳ ${new Date(s.at).toTimeString().slice(0, 5)}`}
+        meta={failed ? `${time} · 갱신 실패` : time}
         extra={<IconButton icon="refresh" label="새로고침" size="xs" variant="ghost" onPress={refresh} />}
       >
         <Stack gap="xs">
@@ -284,7 +312,7 @@ export default function Panel() {
         </Section>
       ) : null}
 
-      <Section title="작업" meta={s.tree.length ? undefined : '없음'}>
+      <Section title="작업" meta={s.intentError ? '읽지 못함' : s.tree.length ? undefined : '없음'}>
         {s.tree.length ? (
           <Tree label="작업 트리" items={s.tree} selected={s.current} defaultExpanded={keys(s.tree)} />
         ) : null}

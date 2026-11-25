@@ -218,11 +218,54 @@ test('a link ends before trailing punctuation or a Korean particle', () => {
 
 test('a link is pinned by its host, not by a host name anywhere in it', () => {
   const r = scan(
-    [say('https://evil.example/?figma.com https://figma.com.evil.example/x https://claude.ai/new https://www.figma.com/file/abc')],
+    [
+      say(
+        'https://evil.example/?figma.com https://figma.com.evil.example/x https://claude.ai/new https://www.figma.com/file/abc https://figma.com@evil.example/x https://claude.ai/public/artifacts/abc-123'
+      )
+    ],
     '/repo',
     'main'
   )
-  assert.deepEqual(r.links, ['https://www.figma.com/file/abc'])
+  assert.deepEqual(r.links, ['https://www.figma.com/file/abc', 'https://claude.ai/public/artifacts/abc-123'])
+})
+
+test('a URL template in code is no link; a Korean path keeps its query; markdown emphasis is not part of a link', () => {
+  const r = scan(
+    [
+      say('fetch(`https://acme.atlassian.net/rest/api/3/issue/${key}`) or GET https://acme.atlassian.net/browse/{KEY}'),
+      say('https://www.figma.com/design/AbC/디자인?node-id=1-2 를 보면, 회의록은 https://www.notion.so/acme/회의록-1a2b를 봐'),
+      say('**https://acme.atlassian.net/wiki/x** and _https://www.figma.com/file/y_')
+    ],
+    '/repo',
+    'main'
+  )
+  assert.deepEqual(r.links, [
+    'https://www.figma.com/design/AbC/디자인?node-id=1-2',
+    'https://www.notion.so/acme/회의록-1a2b',
+    'https://acme.atlassian.net/wiki/x',
+    'https://www.figma.com/file/y'
+  ])
+})
+
+test('a null line or a pasted wall of text does not break the read', () => {
+  const msgs = toMessages(['null', user('x'.repeat(5000))].join('\n'))
+  assert.equal(msgs.length, 1)
+  const [p] = scan(msgs, '/repo', 'main').prompts
+  assert.equal(p?.length, 300) // a prompt row is its first 300 characters: the answer stays small
+  assert.ok(p?.endsWith('…'))
+})
+
+test('a doc read after it was written stays written; a root with a trailing slash is the same root', () => {
+  const r = scan([uses(doc('Write', '/repo/a.md')), uses(doc('Read', '/repo/a.md'))], '/repo/', 'main')
+  assert.deepEqual(r.docs, [{ path: '/repo/a.md', kind: 'new', tag: 'repo' }])
+})
+
+test('an intent label that is not a string reads as one', () => {
+  const { tree } = intentTree({ initial: { ts: 'a', label: 3 as unknown as string }, history: [{ ts: 'b' } as never] })
+  assert.deepEqual(
+    [tree[0]!.label, tree[0]!.children![0]!.label],
+    ['3', '']
+  )
 })
 
 test('a PR mentioned in another letter case is one PR', () => {
@@ -320,10 +363,16 @@ test('slug, Jira keys and CI rollup', () => {
   assert.equal(rollup([]), '')
 })
 
-// ported P6, plus a required status not reported yet and a stale run
-test('CI: a timed-out, cancelled, blocked, expected or stale check is not a pass', () => {
-  for (const c of ['TIMED_OUT', 'CANCELLED', 'ACTION_REQUIRED', 'STARTUP_FAILURE'])
+// ported P6, plus a stale run (GitHub gave up on it: it needs a re-run) and a required
+// status not reported yet
+test('CI: a timed-out, cancelled, blocked or stale check fails; an expected one runs', () => {
+  for (const c of ['TIMED_OUT', 'CANCELLED', 'ACTION_REQUIRED', 'STARTUP_FAILURE', 'STALE'])
     assert.equal(rollup([{ conclusion: 'SUCCESS' }, { conclusion: c }]), '✗')
   assert.equal(rollup([{ conclusion: 'SUCCESS' }, { state: 'EXPECTED' }]), '◐')
-  assert.equal(rollup([{ conclusion: 'SUCCESS' }, { conclusion: 'STALE' }]), '◐')
+})
+
+test('CI: a CheckRun not done yet runs by its status; a null entry is passed over', () => {
+  for (const status of ['QUEUED', 'WAITING', 'REQUESTED', 'IN_PROGRESS'])
+    assert.equal(rollup([{ conclusion: 'SUCCESS' }, { conclusion: null, status }]), '◐')
+  assert.equal(rollup([null, { conclusion: 'SUCCESS', status: 'COMPLETED' }]), '●')
 })
